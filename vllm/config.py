@@ -135,6 +135,11 @@ class ModelConfig:
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
         self.max_model_len = _get_and_verify_max_len(self.hf_text_config,
                                                      max_model_len)
+        
+        # change max model len when model is mistralai/Mixtral-8X7B-Instruct-v0.1
+        if self.model == 'mistralai/Mixtral-8X7B-Instruct-v0.1': 
+            self.max_model_len = 200 * 1024
+
         self._verify_load_format()
         self._verify_tokenizer_mode()
         self._verify_quantization()
