@@ -642,7 +642,7 @@ class LLMEngine:
         # Update the scheduled sequence groups with the model outputs.
         scheduled_seq_groups = scheduler_outputs.scheduled_seq_groups
         for scheduled_seq_group, outputs in zip(scheduled_seq_groups, output):
-            seq_group = scheduled_seq_group.seq_group
+            seq_group:SequenceGroup = scheduled_seq_group.seq_group
             seq_group.update_num_computed_tokens(
                 scheduled_seq_group.token_chunk_size)
             # If uncomputed tokens > 0, it means prefill is chunked.
