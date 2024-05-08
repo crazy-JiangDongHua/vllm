@@ -40,7 +40,7 @@ class SequenceStatus(enum.Enum):
     FINISHED_STOPPED = enum.auto()
     FINISHED_LENGTH_CAPPED = enum.auto()
     FINISHED_ABORTED = enum.auto()
-    FINISHED_IGNORED = enum.auto()
+    FINISHED_IGNORED = enum.auto() # 太长了处理不了
 
     @staticmethod
     def is_finished(status: "SequenceStatus") -> bool:
