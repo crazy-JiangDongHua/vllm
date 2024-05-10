@@ -138,7 +138,7 @@ class ModelConfig:
         
         # change max model len when model is mistralai/Mixtral-8X7B-Instruct-v0.1
         if self.model == 'mistralai/Mixtral-8X7B-Instruct-v0.1': 
-            self.max_model_len = 200 * 1024
+            self.max_model_len = (72 + 4) * 1024
 
         self._verify_load_format()
         self._verify_tokenizer_mode()
