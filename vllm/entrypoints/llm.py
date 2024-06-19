@@ -218,8 +218,12 @@ class LLM:
                         dynamic_ncols=True)
         # Run the engine.
         outputs: List[RequestOutput] = []
+        total_cost, decode_cost = 0.0, 0.0
+        cnt = 0
         while self.llm_engine.has_unfinished_requests():
-            step_outputs = self.llm_engine.step()
+            step_outputs, total_cost, decode_cost = self.llm_engine.step(total_cost, decode_cost)
+            print(f"iter {cnt} done!")
+            cnt += 1
             for output in step_outputs:
                 if output.finished:
                     outputs.append(output)
@@ -227,6 +231,9 @@ class LLM:
                         pbar.update(1)
         if use_tqdm:
             pbar.close()
+
+        print(f"decode cost {decode_cost}s.")
+        print(f"prefill + decode cost {total_cost}s.")  
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
