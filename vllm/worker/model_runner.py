@@ -842,17 +842,23 @@ class ModelRunner:
                 hidden_states = model_executable(**execute_model_kwargs)
 
         # Compute the logits.
-        logits = self.model.compute_logits(hidden_states, sampling_metadata)
+        with torch.cuda.profiler.profile():
+            import nvtx
+            with nvtx.annotate("Compute the logits"):
+                logits = self.model.compute_logits(hidden_states, sampling_metadata)
 
         # Only perform sampling in the driver worker.
         if not sampling_metadata.perform_sampling:
             return None
 
         # Sample the next token.
-        output = self.model.sample(
-            logits=logits,
-            sampling_metadata=sampling_metadata,
-        )
+        with torch.cuda.profiler.profile():
+            import nvtx
+            with nvtx.annotate("sample"):
+                output = self.model.sample(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                )
         return output
 
     @torch.inference_mode()

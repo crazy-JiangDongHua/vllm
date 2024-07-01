@@ -45,14 +45,18 @@ class Sampler(nn.Module):
 
         # Apply min_tokens penalty which sets stop tokens to -inf if min_tokens
         # have not been generated yet
-        logits = _apply_min_tokens_penalty(logits, sampling_metadata)
+        import nvtx
+        with nvtx.annotate("apply min tokens penalty"):
+            logits = _apply_min_tokens_penalty(logits, sampling_metadata)
 
         # Prepare sampling tensors with pinned memory to avoid blocking.
-        (sampling_tensors, do_penalties, do_top_p_top_k,
-         do_min_p) = SamplingTensors.from_sampling_metadata(
-             sampling_metadata, vocab_size, logits.device, logits.dtype)
+        with nvtx.annotate("Prepare sampling tensors"):
+            (sampling_tensors, do_penalties, do_top_p_top_k,
+            do_min_p) = SamplingTensors.from_sampling_metadata(
+                sampling_metadata, vocab_size, logits.device, logits.dtype)
 
         # Apply presence and frequency penalties.
+        print(f"do penalties:{do_penalties}, do_top_p_top_k:{do_top_p_top_k}, do_min_p:{do_min_p}")
         if do_penalties:
             logits = _apply_penalties(logits, sampling_tensors.prompt_tokens,
                                       sampling_tensors.output_tokens,
