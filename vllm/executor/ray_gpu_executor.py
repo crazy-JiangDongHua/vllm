@@ -96,6 +96,16 @@ class RayGPUExecutor(ExecutorBase):
                 num_cpus=0,
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
+                # runtime_env={"nsight":
+                # {
+                #     "t" : "cuda",
+                #     "sample" : "none",
+                #     "cpuctxsw" : "none",
+                #     "c" : "cudaProfilerApi",
+                #     "capture-range-end" : "none",
+                #     "o" : f"/workspace/vllm_test/logs/org_tp/org_tp_rank_{bundle_id}",
+                # }
+                # },
                 **ray_remote_kwargs,
             )(RayWorkerVllm).remote(self.model_config.trust_remote_code)
 

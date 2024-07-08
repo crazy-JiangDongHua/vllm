@@ -113,90 +113,93 @@ class SamplingTensors:
                              get_num_triton_sampler_splits(vocab_size))
 
         sample_indices_start_idx = 0
-        for i, seq_group in enumerate(sampling_metadata.seq_groups):
-            seq_ids, sampling_params = seq_group
-            temperature = sampling_params.temperature
-            p = sampling_params.presence_penalty
-            f = sampling_params.frequency_penalty
-            r = sampling_params.repetition_penalty
-            top_p = sampling_params.top_p
-            min_p = sampling_params.min_p
-            seed = sampling_params.seed
+        import nvtx
+        with nvtx.annotate("cpu cal in prepare sample tensor"):
+            for i, seq_group in enumerate(sampling_metadata.seq_groups):
+                seq_ids, sampling_params = seq_group
+                temperature = sampling_params.temperature
+                p = sampling_params.presence_penalty
+                f = sampling_params.frequency_penalty
+                r = sampling_params.repetition_penalty
+                top_p = sampling_params.top_p
+                min_p = sampling_params.min_p
+                seed = sampling_params.seed
 
-            is_greedy = sampling_params.sampling_type == SamplingType.GREEDY
+                is_greedy = sampling_params.sampling_type == SamplingType.GREEDY
 
-            # k should not be greater than the vocab size.
-            top_k = min(sampling_params.top_k, vocab_size)
-            top_k = vocab_size if top_k == -1 else top_k
-            if temperature < _SAMPLING_EPS:
-                # NOTE: Zero temperature means deterministic sampling
-                # (i.e., greedy sampling or beam search).
-                # Set the temperature to 1 to avoid division by zero.
-                temperature = 1.0
-            if not do_top_p_top_k and (top_p < 1.0 - _SAMPLING_EPS
-                                       or top_k != vocab_size):
-                do_top_p_top_k = True
-            if not do_min_p and min_p > _SAMPLING_EPS:
-                do_min_p = True
-            if not do_penalties and (abs(p) >= _SAMPLING_EPS
-                                     or abs(f) >= _SAMPLING_EPS
-                                     or abs(r - 1.0) >= _SAMPLING_EPS):
-                do_penalties = True
+                # k should not be greater than the vocab size.
+                top_k = min(sampling_params.top_k, vocab_size)
+                top_k = vocab_size if top_k == -1 else top_k
+                if temperature < _SAMPLING_EPS:
+                    # NOTE: Zero temperature means deterministic sampling
+                    # (i.e., greedy sampling or beam search).
+                    # Set the temperature to 1 to avoid division by zero.
+                    temperature = 1.0
+                if not do_top_p_top_k and (top_p < 1.0 - _SAMPLING_EPS
+                                        or top_k != vocab_size):
+                    do_top_p_top_k = True
+                if not do_min_p and min_p > _SAMPLING_EPS:
+                    do_min_p = True
+                if not do_penalties and (abs(p) >= _SAMPLING_EPS
+                                        or abs(f) >= _SAMPLING_EPS
+                                        or abs(r - 1.0) >= _SAMPLING_EPS):
+                    do_penalties = True
 
-            if (i < sampling_metadata.num_prompts
-                    and sampling_params.prompt_logprobs is not None):
-                # For tokens in the prompt that we only need to get
-                # their logprobs
-                prompt_len = sampling_metadata.prompt_lens[i]
-                temperatures += [temperature] * (prompt_len - 1)
-                top_ps += [top_p] * (prompt_len - 1)
-                top_ks += [top_k] * (prompt_len - 1)
-                min_ps += [min_p] * (prompt_len - 1)
-                presence_penalties += [0] * (prompt_len - 1)
-                frequency_penalties += [0] * (prompt_len - 1)
-                repetition_penalties += [1] * (prompt_len - 1)
-                prompt_tokens.extend([] for _ in range(prompt_len - 1))
-                output_tokens.extend([] for _ in range(prompt_len - 1))
-            for seq_id in seq_ids:
-                seq_data = sampling_metadata.seq_data[seq_id]
-                prompt_tokens.append(seq_data.prompt_token_ids)
-                output_tokens.append(seq_data.output_token_ids)
-            temperatures += [temperature] * len(seq_ids)
-            top_ps += [top_p] * len(seq_ids)
-            top_ks += [top_k] * len(seq_ids)
-            min_ps += [min_p] * len(seq_ids)
-            presence_penalties += [p] * len(seq_ids)
-            frequency_penalties += [f] * len(seq_ids)
-            repetition_penalties += [r] * len(seq_ids)
+                if (i < sampling_metadata.num_prompts
+                        and sampling_params.prompt_logprobs is not None):
+                    # For tokens in the prompt that we only need to get
+                    # their logprobs
+                    prompt_len = sampling_metadata.prompt_lens[i]
+                    temperatures += [temperature] * (prompt_len - 1)
+                    top_ps += [top_p] * (prompt_len - 1)
+                    top_ks += [top_k] * (prompt_len - 1)
+                    min_ps += [min_p] * (prompt_len - 1)
+                    presence_penalties += [0] * (prompt_len - 1)
+                    frequency_penalties += [0] * (prompt_len - 1)
+                    repetition_penalties += [1] * (prompt_len - 1)
+                    prompt_tokens.extend([] for _ in range(prompt_len - 1))
+                    output_tokens.extend([] for _ in range(prompt_len - 1))
+                for seq_id in seq_ids:
+                    seq_data = sampling_metadata.seq_data[seq_id]
+                    prompt_tokens.append(seq_data.prompt_token_ids)
+                    output_tokens.append(seq_data.output_token_ids)
+                temperatures += [temperature] * len(seq_ids)
+                top_ps += [top_p] * len(seq_ids)
+                top_ks += [top_k] * len(seq_ids)
+                min_ps += [min_p] * len(seq_ids)
+                presence_penalties += [p] * len(seq_ids)
+                frequency_penalties += [f] * len(seq_ids)
+                repetition_penalties += [r] * len(seq_ids)
 
-            is_prompt = i < sampling_metadata.num_prompts
-            if is_prompt:
-                prompt_best_of.append(sampling_params.best_of)
-                prompt_len = sampling_metadata.prompt_lens[i]
+                is_prompt = i < sampling_metadata.num_prompts
+                if is_prompt:
+                    prompt_best_of.append(sampling_params.best_of)
+                    prompt_len = sampling_metadata.prompt_lens[i]
 
-                if sampling_params.prompt_logprobs is not None:
-                    # NOTE: the sampling position is the last token
-                    # in the prompt
-                    sample_indices_start_idx += prompt_len - 1
-            for seq_id in seq_ids:
-                seq_data = sampling_metadata.seq_data[seq_id]
-                extra_entropy = extra_entropy or ()
-                seq_seeds = cls._get_sequence_seeds(
-                    seed,
-                    seq_data.get_len(),
-                    *extra_entropy,
-                    seq_id,
-                    seeds_to_generate=seeds_to_generate,
-                    is_greedy=is_greedy)
-                sampling_seeds.append(seq_seeds)
-                sample_indices.append(sample_indices_start_idx)
-                sample_indices_start_idx += 1
+                    if sampling_params.prompt_logprobs is not None:
+                        # NOTE: the sampling position is the last token
+                        # in the prompt
+                        sample_indices_start_idx += prompt_len - 1
+                for seq_id in seq_ids:
+                    seq_data = sampling_metadata.seq_data[seq_id]
+                    extra_entropy = extra_entropy or ()
+                    seq_seeds = cls._get_sequence_seeds(
+                        seed,
+                        seq_data.get_len(),
+                        *extra_entropy,
+                        seq_id,
+                        seeds_to_generate=seeds_to_generate,
+                        is_greedy=is_greedy)
+                    sampling_seeds.append(seq_seeds)
+                    sample_indices.append(sample_indices_start_idx)
+                    sample_indices_start_idx += 1
 
         sampling_tensors = SamplingTensors.from_lists(
             temperatures, top_ps, top_ks, min_ps, presence_penalties,
             frequency_penalties, repetition_penalties, sampling_seeds,
             sample_indices, prompt_tokens, output_tokens, vocab_size,
-            extra_seeds_to_generate, device, dtype)
+            extra_seeds_to_generate, device, dtype,
+            do_penalties, do_top_p_top_k, do_min_p)
         return (sampling_tensors, do_penalties, do_top_p_top_k, do_min_p)
 
     @classmethod
@@ -209,7 +212,8 @@ class SamplingTensors:
                    prompt_tokens: List[List[int]],
                    output_tokens: List[List[int]], vocab_size: int,
                    extra_seeds_to_generate: int, device: torch.device,
-                   dtype: torch.dtype) -> "SamplingTensors":
+                   dtype: torch.dtype,
+                   do_penalties, do_top_p_top_k, do_min_p) -> "SamplingTensors":
         # Note that the performance will be very bad without
         # pinned memory.
         pin_memory = is_pin_memory_available()
@@ -223,76 +227,107 @@ class SamplingTensors:
             tokens + [vocab_size] * (output_max_len - len(tokens))
             for tokens in output_tokens
         ]
+        import nvtx
+        with nvtx.annotate("gen pin memory tensor"):
+            temperatures_t = torch.tensor(
+                temperatures,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            print(f"temperatures_t shape: {temperatures_t.shape}")
 
-        temperatures_t = torch.tensor(
-            temperatures,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        top_ps_t = torch.tensor(
-            top_ps,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        min_ps_t = torch.tensor(
-            min_ps,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        presence_penalties_t = torch.tensor(
-            presence_penalties,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        frequency_penalties_t = torch.tensor(
-            frequency_penalties,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        repetition_penalties_t = torch.tensor(
-            repetition_penalties,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        top_ks_t = torch.tensor(
-            top_ks,
-            device="cpu",
-            dtype=torch.int,
-            pin_memory=pin_memory,
-        )
-        sample_indices_t = torch.tensor(
-            sample_indices,
-            device="cpu",
-            dtype=torch.long,
-            pin_memory=pin_memory,
-        )
-        prompt_tensor = torch.tensor(
-            prompt_padded_tokens,
-            device="cpu",
-            dtype=torch.long,
-            pin_memory=pin_memory,
-        )
-        output_tensor = torch.tensor(
-            output_padded_tokens,
-            device="cpu",
-            dtype=torch.long,
-            pin_memory=pin_memory,
-        )
-        # need to transpose and make contiguous to
-        # copy the tensor correctly.
-        # [batch_size, n_seeds] -> [n_seeds, batch_size]
-        sampling_seeds_t = torch.tensor(
-            sampling_seeds,
-            device="cpu",
-            dtype=torch.long,
-            pin_memory=pin_memory,
-        ).T.contiguous()
+            if do_top_p_top_k:
+                top_ps_t = torch.tensor(
+                    top_ps,
+                    device="cpu",
+                    dtype=dtype,
+                    pin_memory=pin_memory,
+                )
+                print(f"top_ps_t shape: {top_ps_t.shape}")
+                top_ks_t = torch.tensor(
+                    top_ks,
+                    device="cpu",
+                    dtype=torch.int,
+                    pin_memory=pin_memory,
+                )
+                print(f"top_ks_t shape: {top_ks_t.shape}")
+            else:
+                top_ps_t = None
+                top_ks_t = None
+            
+            if do_min_p:
+                min_ps_t = torch.tensor(
+                    min_ps,
+                    device="cpu",
+                    dtype=dtype,
+                    pin_memory=pin_memory,
+                )
+                print(f"min_ps_t shape: {min_ps_t.shape}")
+            else:
+                min_ps_t = None
+
+            if do_penalties:
+                presence_penalties_t = torch.tensor(
+                    presence_penalties,
+                    device="cpu",
+                    dtype=dtype,
+                    pin_memory=pin_memory,
+                )
+                print(f"presence_penalties_t shape: {presence_penalties_t.shape}")
+                frequency_penalties_t = torch.tensor(
+                    frequency_penalties,
+                    device="cpu",
+                    dtype=dtype,
+                    pin_memory=pin_memory,
+                )
+                print(f"frequency_penalties_t shape: {frequency_penalties_t.shape}")
+                repetition_penalties_t = torch.tensor(
+                    repetition_penalties,
+                    device="cpu",
+                    dtype=dtype,
+                    pin_memory=pin_memory,
+                )
+                print(f"repetition_penalties_t shape: {repetition_penalties_t.shape}")
+                prompt_tensor = torch.tensor(
+                    prompt_padded_tokens,
+                    device="cpu",
+                    dtype=torch.long,
+                    pin_memory=pin_memory,
+                )
+                print(f"prompt_tensor shape: {prompt_tensor.shape}")
+                output_tensor = torch.tensor(
+                    output_padded_tokens,
+                    device="cpu",
+                    dtype=torch.long,
+                    pin_memory=pin_memory,
+                )
+                print(f"output_tensor shape: {output_tensor.shape}")
+            else:
+                presence_penalties_t = None
+                frequency_penalties_t = None
+                repetition_penalties_t = None
+                prompt_tensor = None
+                output_tensor = None
+            
+            sample_indices_t = torch.tensor(
+                sample_indices,
+                device="cpu",
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            )
+            print(f"sample_indices_t shape: {sample_indices_t.shape}")
+            
+            # need to transpose and make contiguous to
+            # copy the tensor correctly.
+            # [batch_size, n_seeds] -> [n_seeds, batch_size]
+            sampling_seeds_t = torch.tensor(
+                sampling_seeds,
+                device="cpu",
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            ).T.contiguous()
+            print(f"sampling_seeds_t shape: {sampling_seeds_t.shape}")
 
         # Because the memory is pinned, we can do non-blocking
         # transfer to device.
@@ -308,17 +343,17 @@ class SamplingTensors:
 
         return cls(
             temperatures=temperatures_t.to(device=device, non_blocking=True),
-            top_ps=top_ps_t.to(device=device, non_blocking=True),
-            top_ks=top_ks_t.to(device=device, non_blocking=True),
-            min_ps=min_ps_t.to(device=device, non_blocking=True),
+            top_ps=top_ps_t.to(device=device, non_blocking=True) if top_ps_t is not None else None,
+            top_ks=top_ks_t.to(device=device, non_blocking=True) if top_ks_t is not None else None,
+            min_ps=min_ps_t.to(device=device, non_blocking=True) if min_ps_t is not None else None,
             presence_penalties=presence_penalties_t.to(device=device,
-                                                       non_blocking=True),
+                                                       non_blocking=True) if presence_penalties_t is not None else None,
             frequency_penalties=frequency_penalties_t.to(device=device,
-                                                         non_blocking=True),
+                                                         non_blocking=True) if frequency_penalties_t is not None else None,
             repetition_penalties=repetition_penalties_t.to(device=device,
-                                                           non_blocking=True),
-            prompt_tokens=prompt_tensor.to(device=device, non_blocking=True),
-            output_tokens=output_tensor.to(device=device, non_blocking=True),
+                                                           non_blocking=True) if repetition_penalties_t is not None else None,
+            prompt_tokens=prompt_tensor.to(device=device, non_blocking=True) if prompt_tensor is not None else None,
+            output_tokens=output_tensor.to(device=device, non_blocking=True) if output_tensor is not None else None,
             sampling_seeds=sampling_seeds_gpu,
             sample_indices=sample_indices_t.to(device=device,
                                                non_blocking=True),

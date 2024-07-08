@@ -94,7 +94,9 @@ class LLMEngine:
             f"max_seq_len={model_config.max_model_len}, "
             f"download_dir={model_config.download_dir!r}, "
             f"load_format={model_config.load_format}, "
-            f"tensor_parallel_size={parallel_config.tensor_parallel_size}, "
+            f"tensor_parallel_size={parallel_config.tensor_parallel_size},"
+            f"atten_tensor_parallel_size={parallel_config.atten_tensor_parallel_size},"
+            f"atten_data_parallel_size={parallel_config.atten_data_parallel_size},"
             f"disable_custom_all_reduce="
             f"{parallel_config.disable_custom_all_reduce}, "
             f"quantization={model_config.quantization}, "
@@ -669,7 +671,7 @@ class LLMEngine:
             self.stat_logger.log(self._get_stats(scheduler_outputs))
         return request_outputs
 
-    def step(self) -> List[RequestOutput]:
+    def step(self, total_cost, decode_cost) -> Tuple[List[RequestOutput], float, float]:
         """Performs one decoding iteration and returns newly generated results.
 
         .. figure:: https://i.imgur.com/sv2HssD.png
@@ -722,15 +724,37 @@ class LLMEngine:
         """
         seq_group_metadata_list, scheduler_outputs = self.scheduler.schedule()
 
-        if not scheduler_outputs.is_empty():
-            output = self.model_executor.execute_model(
-                seq_group_metadata_list, scheduler_outputs.blocks_to_swap_in,
-                scheduler_outputs.blocks_to_swap_out,
-                scheduler_outputs.blocks_to_copy)
-        else:
-            output = []
+        import time
+        import nvtx
 
-        return self._process_model_outputs(output, scheduler_outputs)
+        if scheduler_outputs.num_prefill_groups == 0:
+            msg = "decode"
+            color = "red"
+        else:
+            msg = "prefill"
+            color = "blue"
+        with nvtx.annotate(msg, color=color):
+        
+            t1 = time.perf_counter()
+
+            if not scheduler_outputs.is_empty():
+                output = self.model_executor.execute_model(
+                    seq_group_metadata_list, scheduler_outputs.blocks_to_swap_in,
+                    scheduler_outputs.blocks_to_swap_out,
+                    scheduler_outputs.blocks_to_copy)
+            else:
+                output = []
+            
+            t2 = time.perf_counter()
+
+        if scheduler_outputs.num_prefill_groups == 0:
+            decode_cost += t2-t1
+        total_cost += t2-t1
+
+        with nvtx.annotate("process model outputs"):
+            result = self._process_model_outputs(output, scheduler_outputs)
+
+        return result, total_cost, decode_cost
 
     def do_log_stats(self) -> None:
         """Forced log when no requests active."""
@@ -817,6 +841,9 @@ class LLMEngine:
        new_char_count is the number of chars added to the
            sequence's output text for the newly generated token
         """
+        if seq.get_output_len() == sampling_params.max_tokens:
+            seq.status = SequenceStatus.FINISHED_STOPPED
+        return
 
         # Check if the minimum number of tokens has been generated yet;
         # skip the stop string/token checks if not

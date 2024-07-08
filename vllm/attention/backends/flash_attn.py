@@ -101,6 +101,46 @@ class FlashAttentionMetadata(AttentionMetadataPerStage,
     # TODO(woosuk): Move `use_cuda_graph` out since it's unrelated to attention.
     use_cuda_graph: bool
 
+    def get_sub_attn_metadata(self, seq_indexes):
+        sub_context_lens = self.context_lens[seq_indexes]
+        sub_block_tables = self.block_tables[seq_indexes]
+        if self.is_prompt:
+            sub_max_context_len = None
+            sub_prompt_lens = [self.prompt_lens[i] for i in seq_indexes]
+            sub_prompt_lens_tensor = self.prompt_lens_tensor[seq_indexes]
+            # bad impl for chunk prefill
+            sub_max_subquery_len = max(sub_prompt_lens)
+            sub_max_prompt_len = max(sub_prompt_lens)
+            # bad impl for chunk prefill
+            sub_subquery_start_loc = torch.cumsum(torch.tensor([0] + sub_prompt_lens), 0)
+            sub_subquery_start_loc = sub_subquery_start_loc.to(device=self.subquery_start_loc.device, 
+                                                               dtype=self.subquery_start_loc.dtype)
+            sub_seq_start_loc = torch.cumsum(torch.tensor([0] + sub_prompt_lens), 0)
+            sub_seq_start_loc = sub_seq_start_loc.to(device=self.subquery_start_loc.device, 
+                                                     dtype=self.subquery_start_loc.dtype)
+        else:
+            sub_max_context_len = torch.max(sub_context_lens).cpu().item()
+            sub_prompt_lens = None
+            sub_prompt_lens_tensor = None
+            sub_max_subquery_len = None
+            sub_max_prompt_len = None
+            sub_subquery_start_loc = None
+            sub_seq_start_loc = None
+
+        return FlashAttentionMetadata(
+            context_lens=sub_context_lens,
+            max_context_len=sub_max_context_len,
+            block_tables=sub_block_tables,
+            is_prompt=self.is_prompt,
+            prompt_lens=sub_prompt_lens,
+            prompt_lens_tensor=sub_prompt_lens_tensor,
+            max_subquery_len=sub_max_subquery_len,
+            max_prompt_len=sub_max_prompt_len,
+            subquery_start_loc=sub_subquery_start_loc,
+            seq_start_loc=sub_seq_start_loc,
+            use_cuda_graph=self.use_cuda_graph
+        )
+
 
 class FlashAttentionImpl(AttentionImpl):
     """

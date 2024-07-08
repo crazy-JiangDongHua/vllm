@@ -30,8 +30,13 @@ from transformers import MixtralConfig
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import LoRAConfig
 from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_atten_data_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce)
+                              tensor_model_parallel_all_reduce,
+                              get_atten_tensor_model_parallel_world_size,
+                              get_atten_data_model_parallel_world_size,
+                              atten_data_model_parallel_all_gather_diff_batchsize,
+                             )
 from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
@@ -124,6 +129,11 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        # routing_weights = torch.softmax(router_logits,
+        #                                 dim=-1,
+        #                                 dtype=torch.float32)
+        # topk_weights, topk_ids = torch.topk(routing_weights, 2, dim=-1)
+        # print(f"select expert {topk_ids}")
         final_hidden_states = fused_moe(hidden_states,
                                         self.ws,
                                         self.w2s,
@@ -151,7 +161,7 @@ class MixtralAttention(nn.Module):
                  sliding_window: Optional[int] = None) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_atten_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -185,6 +195,7 @@ class MixtralAttention(nn.Module):
             hidden_size,
             bias=False,
             linear_method=linear_method,
+            is_atten_tp=True
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -252,6 +263,7 @@ class MixtralDecoderLayer(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        cumsum_batchsize_list: List[int],
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -260,13 +272,34 @@ class MixtralDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-        )
+        
+        # use dp
+        if cumsum_batchsize_list:
+            dp_rank = get_atten_data_model_parallel_rank()   
+            # select hidden states for current rank
+            hidden_states = \
+                hidden_states[cumsum_batchsize_list[dp_rank]:cumsum_batchsize_list[dp_rank+1]]
+            
+            # 有可能某个 rank 没有输入
+            if cumsum_batchsize_list[dp_rank+1] - cumsum_batchsize_list[dp_rank] > 0:
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    kv_cache=kv_cache,
+                    attn_metadata=attn_metadata,
+                )
 
+            # all gather different batch size hidden_states, here
+            hidden_states = atten_data_model_parallel_all_gather_diff_batchsize(hidden_states, 
+                                                                                cumsum_batchsize_list)
+        else:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+            )
+        
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
@@ -293,6 +326,7 @@ class MixtralModel(nn.Module):
             self.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
+            is_atten_tp=False
         )
         self.layers = nn.ModuleList([
             MixtralDecoderLayer(config, linear_method=linear_method)
@@ -306,15 +340,22 @@ class MixtralModel(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        cumsum_batchsize_list: List[int],
     ) -> torch.Tensor:
+        # 这里没有空的输入
         hidden_states = self.embed_tokens(input_ids)
+
+        # world_rank = get_tensor_model_parallel_rank()        
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
+            # import nvtx
+            # with nvtx.annotate(f"rank {world_rank}: layer {i}", color='pink'):
             hidden_states, residual = layer(positions, hidden_states,
                                             kv_caches[i], attn_metadata,
-                                            residual)
+                                            residual, cumsum_batchsize_list)
         hidden_states, _ = self.norm(hidden_states, residual)
+
         return hidden_states
 
 
@@ -374,9 +415,10 @@ class MixtralForCausalLM(nn.Module):
         positions: torch.Tensor,
         kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        cumsum_batchsize_list: List[int],
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata)
+                                   attn_metadata, cumsum_batchsize_list)
         return hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor,

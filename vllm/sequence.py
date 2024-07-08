@@ -402,6 +402,9 @@ class SequenceGroup:
         arrival_time: The arrival time of the request.
         lora_request: LoRA request.
         multi_modal_data: Multi modal data associated with the request.
+        dp_res: the dp rank after dp dipatch, 
+                 >=0 means dp rank
+                 -1 means seq which have not been dispathed, 
     """
 
     def __init__(
@@ -412,6 +415,7 @@ class SequenceGroup:
         arrival_time: float,
         lora_request: Optional[LoRARequest] = None,
         multi_modal_data: Optional[MultiModalData] = None,
+        dp_res: int = -1,
     ) -> None:
         self.request_id = request_id
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
@@ -425,6 +429,7 @@ class SequenceGroup:
         self.prompt_logprobs: Optional[PromptLogprobs] = None
         self.state = SequenceGroupState()
         self.multi_modal_data = multi_modal_data
+        self.dp_res = dp_res
 
     @property
     def prompt(self) -> str:
@@ -562,6 +567,10 @@ class SequenceGroupMetadata:
         state: Internal state tied to this sequence group.
         lora_request: LoRA request.
         multi_modal_data: Multi modal data.
+        dp_res: the rank after dp dipatch before, 
+                >=0 means dp rank
+                -1 means seq which have not been dispathed, 
+        seq_group: to change dp_res value when dp dispatch
     """
 
     def __init__(
@@ -576,6 +585,8 @@ class SequenceGroupMetadata:
         computed_block_nums: Optional[List[int]] = None,
         state: Optional[SequenceGroupState] = None,
         multi_modal_data: Optional[MultiModalData] = None,
+        dp_res: int = -1,
+        seq_group: Optional[SequenceGroup] = None
     ) -> None:
         self.request_id = request_id
         self.is_prompt = is_prompt
@@ -587,6 +598,8 @@ class SequenceGroupMetadata:
         self.multi_modal_data = multi_modal_data
         self.state = SequenceGroupState() if state is None else state
         self._token_chunk_size = token_chunk_size
+        self.dp_res = dp_res
+        self.seq_group = seq_group
 
         if self._token_chunk_size is None:
             if is_prompt:
@@ -693,3 +706,25 @@ class SamplerOutput:
     def __eq__(self, other: object):
         return isinstance(other,
                           self.__class__) and self.outputs == other.outputs
+    
+    def reorder_by_indexes(self, indexex: List[int]):
+        '''
+        indexex: seqgroup 的 indexes
+        '''
+        import torch
+        tensor_indexex = torch.tensor(indexex, dtype=torch.long)
+        outputs = [self.outputs[i] for i in indexex]
+        if self.sampled_token_probs:
+            sampled_token_probs = self.sampled_token_probs.index_select(0, tensor_indexex)
+        else:
+            sampled_token_probs = None
+        if self.sampled_token_ids:
+            sampled_token_ids = self.sampled_token_ids.index_select(0, tensor_indexex)
+        else:
+            sampled_token_ids = None
+        return SamplerOutput(
+            outputs=outputs,
+            sampled_token_probs=sampled_token_probs,
+            sampled_token_ids=sampled_token_ids,
+            spec_decode_worker_metrics=self.spec_decode_worker_metrics
+        )

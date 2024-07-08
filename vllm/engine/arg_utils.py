@@ -28,8 +28,10 @@ class EngineArgs:
     seed: int = 0
     max_model_len: Optional[int] = None
     worker_use_ray: bool = False
-    pipeline_parallel_size: int = 1
-    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1 # PP
+    atten_tensor_parallel_size: int = 1   # Attention TP
+    atten_data_parallel_size: int = 1     # Attention DP
+    tensor_parallel_size: int = 1     # FFN TP
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 16
     enable_prefix_caching: bool = False
@@ -218,11 +220,21 @@ class EngineArgs:
                             type=int,
                             default=EngineArgs.pipeline_parallel_size,
                             help='number of pipeline stages')
+        parser.add_argument('--atten-tensor-parallel-size',
+                            '-atten_tp',
+                            type=int,
+                            default=EngineArgs.atten_tensor_parallel_size,
+                            help='number of attention tensor parallel replicas')
+        parser.add_argument('--atten-data-parallel-size',
+                            '-atten_dp',
+                            type=int,
+                            default=EngineArgs.atten_data_parallel_size,
+                            help='number of attention data parallel replicas')
         parser.add_argument('--tensor-parallel-size',
                             '-tp',
                             type=int,
                             default=EngineArgs.tensor_parallel_size,
-                            help='number of tensor parallel replicas')
+                            help='number of ffn tensor parallel replicas')
         parser.add_argument(
             '--max-parallel-loading-workers',
             type=int,
@@ -456,7 +468,8 @@ class EngineArgs:
                                    model_config.get_sliding_window(),
                                    self.enable_prefix_caching)
         parallel_config = ParallelConfig(
-            self.pipeline_parallel_size, self.tensor_parallel_size,
+            self.pipeline_parallel_size, self.atten_tensor_parallel_size,
+            self.atten_data_parallel_size, self.tensor_parallel_size,
             self.worker_use_ray, self.max_parallel_loading_workers,
             self.disable_custom_all_reduce,
             TokenizerPoolConfig.create_config(

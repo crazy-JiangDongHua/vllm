@@ -6,10 +6,14 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                              get_atten_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
+                              get_atten_tensor_model_parallel_world_size,
                               split_tensor_along_last_dim,
                               tensor_model_parallel_all_gather,
-                              tensor_model_parallel_all_reduce)
+                              atten_tensor_model_parallel_all_gather,
+                              tensor_model_parallel_all_reduce,
+                              atten_tensor_model_parallel_all_reduce)
 from vllm.logger import init_logger
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -164,6 +168,7 @@ class ColumnParallelLinear(torch.nn.Module):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         linear_method: Optional[LinearMethodBase] = None,
+        is_atten_tp: bool = False
     ):
         super().__init__()
 
@@ -171,8 +176,12 @@ class ColumnParallelLinear(torch.nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.gather_output = gather_output
+        self.is_atten_tp = is_atten_tp
         # Divide the weight matrix along the last dimension.
-        tp_size = get_tensor_model_parallel_world_size()
+        if is_atten_tp:
+            tp_size = get_atten_tensor_model_parallel_world_size()
+        else:
+            tp_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, tp_size)
         self.skip_bias_add = skip_bias_add
         if params_dtype is None:
@@ -200,7 +209,10 @@ class ColumnParallelLinear(torch.nn.Module):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
+        if self.is_atten_tp:
+            tp_rank = get_atten_tensor_model_parallel_rank()
+        else:
+            tp_rank = get_tensor_model_parallel_rank()
         output_dim = getattr(param, "output_dim", None)
         param_data = param.data
         if output_dim is not None:
@@ -218,7 +230,10 @@ class ColumnParallelLinear(torch.nn.Module):
         output_parallel = self.linear_method.apply_weights(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
-            output = tensor_model_parallel_all_gather(output_parallel)
+            if self.is_atten_tp:
+                output = atten_tensor_model_parallel_all_gather(output_parallel)
+            else:
+                output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
@@ -373,7 +388,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
-        tp_size = get_tensor_model_parallel_world_size()
+        # attention tp size
+        tp_size = get_atten_tensor_model_parallel_world_size()
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
@@ -386,7 +402,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         output_size = (self.num_heads +
                        2 * self.num_kv_heads) * tp_size * self.head_size
         super().__init__(input_size, output_size, bias, False, skip_bias_add,
-                         params_dtype, linear_method)
+                         params_dtype, linear_method, True)
 
     def weight_loader(self,
                       param: Parameter,
@@ -427,7 +443,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 self.weight_loader(param, loaded_weight_shard, shard_id)
             return
 
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank = get_atten_tensor_model_parallel_rank()
         assert loaded_shard_id in ["q", "k", "v"]
         if output_dim is not None:
             if loaded_shard_id == "q":
@@ -508,6 +524,7 @@ class RowParallelLinear(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = True,
         linear_method: Optional[LinearMethodBase] = None,
+        is_atten_tp: bool = False
     ):
         super().__init__()
         # Keep input parameters
@@ -518,9 +535,13 @@ class RowParallelLinear(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
+        self.is_atten_tp = is_atten_tp
 
-        # Divide the weight matrix along the last dimension.
-        self.tp_size = get_tensor_model_parallel_world_size()
+        # Divide the weight matrix along the first dimension.
+        if self.is_atten_tp:
+            self.tp_size = get_atten_tensor_model_parallel_world_size()
+        else:
+            self.tp_size = get_tensor_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, self.tp_size)
         self.skip_bias_add = skip_bias_add
         if linear_method is None:
@@ -549,7 +570,10 @@ class RowParallelLinear(torch.nn.Module):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
+        if self.is_atten_tp:
+            tp_rank = get_atten_tensor_model_parallel_rank()
+        else:
+            tp_rank = get_tensor_model_parallel_rank()
         input_dim = getattr(param, "input_dim", None)
         param_data = param.data
         if input_dim is not None:
@@ -565,7 +589,10 @@ class RowParallelLinear(torch.nn.Module):
         if self.input_is_parallel:
             input_parallel = input_
         else:
-            tp_rank = get_tensor_model_parallel_rank()
+            if self.is_atten_tp:
+                tp_rank = get_atten_tensor_model_parallel_rank()
+            else:
+                tp_rank = get_tensor_model_parallel_rank()
             splitted_input = split_tensor_along_last_dim(
                 input_, num_partitions=self.tp_size)
             input_parallel = splitted_input[tp_rank].contiguous()
@@ -574,7 +601,10 @@ class RowParallelLinear(torch.nn.Module):
         output_parallel = self.linear_method.apply_weights(
             self, input_parallel)
         if self.reduce_results and self.tp_size > 1:
-            output_ = tensor_model_parallel_all_reduce(output_parallel)
+            if self.is_atten_tp:
+                output_ = atten_tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output_ = output_parallel
 

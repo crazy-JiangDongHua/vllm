@@ -93,6 +93,34 @@ class AttentionMetadata(Generic[T]):
             assert self.prefill_metadata is not None
         if self.num_decode_tokens > 0:
             assert self.decode_metadata is not None
+    
+    def get_sub_attn_metadata(self, seq_indexes):
+        if self.num_prefill_tokens > 0:
+            sub_num_prefills = len(seq_indexes)
+            sub_num_prefill_tokens = sum([self.prefill_metadata.prompt_lens[i] for i in seq_indexes])
+            sub_num_decode_tokens = 0
+            sub_prefill_metadata = self.prefill_metadata.get_sub_attn_metadata(seq_indexes)
+            sub_decode_metadata = None
+            sub_slot_mapping = torch.concat([self.slot_mapping[self.prefill_metadata.subquery_start_loc[i] : \
+                                                               self.prefill_metadata.subquery_start_loc[i+1]]
+                                             for i in seq_indexes])
+        if self.num_decode_tokens > 0:
+            sub_num_decode_tokens = len(seq_indexes)
+            sub_num_prefills = 0
+            sub_num_prefill_tokens = 0
+            sub_prefill_metadata = None
+            sub_decode_metadata = self.decode_metadata.get_sub_attn_metadata(seq_indexes)
+            sub_slot_mapping = self.slot_mapping[seq_indexes]
+        
+        return AttentionMetadata(
+            num_prefills=sub_num_prefills,
+            num_prefill_tokens=sub_num_prefill_tokens,
+            num_decode_tokens=sub_num_decode_tokens,
+            prefill_metadata=sub_prefill_metadata,
+            decode_metadata=sub_decode_metadata,
+            slot_mapping=sub_slot_mapping,
+            kv_cache_dtype=self.kv_cache_dtype
+        )
 
 
 class AttentionImpl(ABC):

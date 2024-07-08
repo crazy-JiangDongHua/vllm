@@ -5,8 +5,11 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                              get_atten_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce)
+                              get_atten_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_reduce,
+                              atten_tensor_model_parallel_all_reduce)
 from vllm.model_executor.utils import set_weight_attrs
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
@@ -51,7 +54,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                  embedding_dim: int,
                  params_dtype: Optional[torch.dtype] = None,
                  org_num_embeddings: Optional[int] = None,
-                 padding_size: int = DEFAULT_VOCAB_PADDING_SIZE):
+                 padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+                 is_atten_tp: bool = False):
         super().__init__()
 
         # Keep the input dimensions.
@@ -62,11 +66,17 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.embedding_dim = embedding_dim
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.is_atten_tp = is_atten_tp
+        if self.is_atten_tp:
+            self.tp_size = get_atten_tensor_model_parallel_world_size()
+            self.tp_rank = get_atten_tensor_model_parallel_rank()
+        else: 
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_rank = get_tensor_model_parallel_rank()
         # Divide the weight matrix along the vocaburaly dimension.
         self.vocab_start_index, self.vocab_end_index = (
             vocab_range_from_global_vocab_size(
-                self.num_embeddings_padded, get_tensor_model_parallel_rank(),
+                self.num_embeddings_padded, self.tp_rank,
                 self.tp_size))
         self.num_embeddings_per_partition = (self.vocab_end_index -
                                              self.vocab_start_index)
@@ -102,7 +112,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tp_size > 1:
             output_parallel[input_mask, :] = 0.0
         # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
+        if self.is_atten_tp:
+            output = atten_tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = tensor_model_parallel_all_reduce(output_parallel)
         return output
 
 

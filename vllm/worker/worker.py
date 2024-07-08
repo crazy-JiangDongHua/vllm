@@ -125,6 +125,7 @@ class Worker(WorkerBase):
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
+        # return 51495, 8192 # 62087, 8192
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         torch.cuda.empty_cache()
@@ -236,9 +237,12 @@ class Worker(WorkerBase):
         # If there is no input, we don't need to execute the model.
         if num_seq_groups == 0:
             return {}
-
+        # import nvtx
+        # with nvtx.annotate("execute model", color='green'):
+        # torch.cuda.profiler.start()
         output = self.model_runner.execute_model(seq_group_metadata_list,
                                                  self.gpu_cache)
+        # torch.cuda.profiler.stop()
         return output
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -293,8 +297,10 @@ def init_worker_distributed_environment(
             init_method=distributed_init_method,
         )
 
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+    ensure_model_parallel_initialized(parallel_config.atten_tensor_parallel_size,
+                                      parallel_config.pipeline_parallel_size,
+                                      parallel_config.atten_data_parallel_size,
+                                      parallel_config.tensor_parallel_size)
 
     # Initialize a custom fast all-reduce implementation.
     if not parallel_config.disable_custom_all_reduce:

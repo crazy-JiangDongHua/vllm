@@ -138,7 +138,7 @@ class ModelConfig:
         
         # change max model len when model is mistralai/Mixtral-8X7B-Instruct-v0.1
         if self.model == 'mistralai/Mixtral-8X7B-Instruct-v0.1': 
-            self.max_model_len = (72 + 4) * 1024
+            self.max_model_len = (200 + 4) * 1024
 
         self._verify_load_format()
         self._verify_tokenizer_mode()
@@ -243,12 +243,12 @@ class ModelConfig:
         parallel_config: "ParallelConfig",
     ) -> None:
         total_num_attention_heads = self.hf_text_config.num_attention_heads
-        tensor_parallel_size = parallel_config.tensor_parallel_size
-        if total_num_attention_heads % tensor_parallel_size != 0:
+        atten_tensor_parallel_size = parallel_config.atten_tensor_parallel_size
+        if total_num_attention_heads % atten_tensor_parallel_size != 0:
             raise ValueError(
                 f"Total number of attention heads ({total_num_attention_heads})"
-                " must be divisible by tensor parallel size "
-                f"({tensor_parallel_size}).")
+                " must be divisible by attention tensor parallel size "
+                f"({atten_tensor_parallel_size}).")
 
         total_num_hidden_layers = self.hf_text_config.num_hidden_layers
         pipeline_parallel_size = parallel_config.pipeline_parallel_size
@@ -330,7 +330,7 @@ class ModelConfig:
         # case where the number of KV heads is smaller than the tensor
         # parallel size so each GPU has at least one KV head.
         return max(1,
-                   total_num_kv_heads // parallel_config.tensor_parallel_size)
+                   total_num_kv_heads // parallel_config.atten_tensor_parallel_size)
 
     def get_num_layers(self, parallel_config: "ParallelConfig") -> int:
         total_num_hidden_layers = self.hf_text_config.num_hidden_layers
@@ -499,6 +499,8 @@ class ParallelConfig:
     def __init__(
         self,
         pipeline_parallel_size: int,
+        atten_tensor_parallel_size: int,
+        atten_data_parallel_size: int,
         tensor_parallel_size: int,
         worker_use_ray: bool,
         max_parallel_loading_workers: Optional[int] = None,
@@ -508,6 +510,8 @@ class ParallelConfig:
         placement_group: Optional["PlacementGroup"] = None,
     ) -> None:
         self.pipeline_parallel_size = pipeline_parallel_size
+        self.atten_tensor_parallel_size = atten_tensor_parallel_size
+        self.atten_data_parallel_size = atten_data_parallel_size
         self.tensor_parallel_size = tensor_parallel_size
         self.worker_use_ray = worker_use_ray
         self.max_parallel_loading_workers = max_parallel_loading_workers
@@ -516,12 +520,20 @@ class ParallelConfig:
         self.ray_workers_use_nsight = ray_workers_use_nsight
         self.placement_group = placement_group
 
-        self.world_size = pipeline_parallel_size * self.tensor_parallel_size
+        self.world_size = pipeline_parallel_size * atten_tensor_parallel_size * atten_data_parallel_size
         if self.world_size > 1:
             self.worker_use_ray = True
         self._verify_args()
 
     def _verify_args(self) -> None:
+        if self.atten_data_parallel_size not in {1,2}:
+            raise NotImplementedError(
+                "Currently, DP and TP are mixed,"
+                f"Only support dp size is equal 1 or 2, but get {self.atten_data_parallel_size}")
+        if self.atten_tensor_parallel_size * self.atten_data_parallel_size != self.tensor_parallel_size:
+            raise NotImplementedError(
+                "Currently, DP and TP are mixed, and only Attention "
+                "and ffn are supported using the same number of GPUs.")
         if self.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallelism is not supported yet.")

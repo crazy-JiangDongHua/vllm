@@ -5,17 +5,30 @@
 """Tensor and pipeline parallel groups."""
 import contextlib
 from typing import Optional
+from typing import List
 
 import torch
+import torch.distributed
 
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Tensor model parallel group that the current rank belongs to.
-_TENSOR_MODEL_PARALLEL_GROUP = None
+# when attention data parallel size = 1
+# the Attention Tensor model parallel group should be same as
+# the FFN Tensor model parallel group 
+
+# Attention Tensor model parallel group that the current rank belongs to.
+_ATTEN_TENSOR_MODEL_PARALLEL_GROUP = None
 # Pipeline model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
+# Attention Data model parallel group that the current rank belongs to.
+_ATTEN_DATA_MODEL_PARALLEL_GROUP = None
+# (FFN) Tensor model parallel group that the current rank belongs to.
+_TENSOR_MODEL_PARALLEL_GROUP = None
+
+# Global Ranks of All Attention Tensor model parallel group, 
+_ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS = None
 
 # when people blindly call `torch.distributed.all_reduce` etc,
 # it will use this group. It is initialized with the `backend`
@@ -78,27 +91,40 @@ def init_distributed_environment(
 
 
 def initialize_model_parallel(
-    tensor_model_parallel_size: int = 1,
+    atten_tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    atten_data_model_parallel_size: int = 1,
+    tensor_model_parallel_size: int = 1,
     backend: Optional[str] = None,
 ) -> None:
     """
     Initialize model parallel groups.
 
     Arguments:
-        tensor_model_parallel_size: number of GPUs used for tensor model
-            parallelism.
-        pipeline_model_parallel_size: number of GPUs used for pipeline model
-            parallelism.
+        atten_tensor_model_parallel_size: 
+            number of GPUs used for attention tensor model parallelism.
+        pipeline_model_parallel_size: 
+            number of GPUs used for pipeline model parallelism.
+        atten_data_model_parallel_size: 
+            number of GPUs used for attention data model parallelism.
+        tensor_model_parallel_size:
+            number of GPUs used for (ffn) tensor model parallelism.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
-    use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
-    the model pipeline. The present function will
-    create 4 tensor model-parallel groups and 2 pipeline model-parallel groups:
-        4 tensor model-parallel groups:
+    use 2 GPUs to parallelize the attention tensor, 2 GPUs to parallelize
+    the model pipeline, 2 GPUs to parallelize the attention input data, 
+    and 4 GPUs to parallelize the ffn tensor.
+    The present function will create 4 attention tensor model-parallel groups, 
+    4 pipeline model-parallel groups, and 2 attention data model-parallel groups, 
+    2 ffn tensor model-parallel groups:
+        4 attention tensor model-parallel groups:
             [g0, g1], [g2, g3], [g4, g5], [g6, g7]
-        2 pipeline model-parallel groups:
-            [g0, g2, g4, g6], [g1, g3, g5, g7]
+        4 pipeline model-parallel groups:
+            [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+        4 attention data model-parallel groups:
+            [g0, g2], [g1, g3], [g4, g6], [g5, g7]
+        2 (ffn) tensor model-parallel groups:
+            [g0, g1, g2, g3], [g4, g5, g6, g7]
     Note that for efficiency, the caller should make sure adjacent ranks
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
@@ -111,19 +137,35 @@ def initialize_model_parallel(
     backend = backend or torch.distributed.get_backend()
 
     if (world_size !=
-            tensor_model_parallel_size * pipeline_model_parallel_size):
+            atten_tensor_model_parallel_size * \
+            pipeline_model_parallel_size * \
+            atten_data_model_parallel_size):
         raise RuntimeError(
             f"world_size ({world_size}) is not equal to "
-            f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
-            f"pipeline_model_parallel_size ({pipeline_model_parallel_size})")
+            f"atten_tensor_model_parallel_size ({atten_tensor_model_parallel_size}) x "
+            f"pipeline_model_parallel_size ({pipeline_model_parallel_size}) x "
+            f"atten_data_model_parallel_size ({atten_data_model_parallel_size})")
 
-    num_tensor_model_parallel_groups: int = (world_size //
-                                             tensor_model_parallel_size)
+    if (tensor_model_parallel_size !=
+            atten_tensor_model_parallel_size *\
+            atten_data_model_parallel_size):
+        raise RuntimeError(
+            f"tensor_model_parallel_size ({tensor_model_parallel_size}) is not equal to "
+            f"atten_tensor_model_parallel_size ({atten_tensor_model_parallel_size}) x "
+            f"atten_data_model_parallel_size ({atten_data_model_parallel_size})")
+
+    num_atten_tensor_model_parallel_groups: int = (world_size //
+                                                    atten_tensor_model_parallel_size)
     num_pipeline_model_parallel_groups: int = (world_size //
-                                               pipeline_model_parallel_size)
+                                                pipeline_model_parallel_size)
+    num_atten_data_model_parallel_groups: int = (world_size //
+                                                    atten_data_model_parallel_size)
+    num_tensor_model_parallel_groups: int = (world_size //
+                                                    tensor_model_parallel_size)
     rank = torch.distributed.get_rank()
 
-    # Build the tensor model-parallel groups.
+    # Build the (ffn) tensor model-parallel groups.
+    # also is the default tensor model-parallel groups
     global _TENSOR_MODEL_PARALLEL_GROUP
     assert _TENSOR_MODEL_PARALLEL_GROUP is None, (
         "tensor model parallel group is already initialized")
@@ -133,7 +175,32 @@ def initialize_model_parallel(
         group = torch.distributed.new_group(ranks, backend=backend)
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
-
+    
+    # Build the attention tensor model-parallel groups.
+    global _ATTEN_TENSOR_MODEL_PARALLEL_GROUP
+    global _ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS
+    assert _ATTEN_TENSOR_MODEL_PARALLEL_GROUP is None and \
+           _ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS is None, (
+        "attention tensor model parallel group is already initialized")
+    
+    _ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS = []
+    if tensor_model_parallel_size == atten_tensor_model_parallel_size:
+        # it means don't use dp, so attention and ffn are in a same tp group
+        _ATTEN_TENSOR_MODEL_PARALLEL_GROUP = _TENSOR_MODEL_PARALLEL_GROUP
+        _ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS.append(
+            torch.distributed.get_process_group_ranks(
+                _ATTEN_TENSOR_MODEL_PARALLEL_GROUP
+            )
+        )
+    else:
+        for i in range(num_atten_tensor_model_parallel_groups):
+            ranks = range(i * atten_tensor_model_parallel_size,
+                        (i + 1) * atten_tensor_model_parallel_size)
+            _ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS.append(list(ranks))
+            group = torch.distributed.new_group(ranks, backend=backend)
+            if rank in ranks:
+                _ATTEN_TENSOR_MODEL_PARALLEL_GROUP = group
+        
     # Build the pipeline model-parallel groups.
     global _PIPELINE_MODEL_PARALLEL_GROUP
     global _PIPELINE_GLOBAL_RANKS
@@ -145,11 +212,26 @@ def initialize_model_parallel(
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
+    
+    # Build the attention data model-parallel groups.
+    global _ATTEN_DATA_MODEL_PARALLEL_GROUP
+    assert _ATTEN_DATA_MODEL_PARALLEL_GROUP is None, (
+        "attention data model parallel group is already initialized")
+    atten_dp_group_per_tp_group = tensor_model_parallel_size // atten_data_model_parallel_size
+    for i in range(num_atten_data_model_parallel_groups):
+        start = (i // atten_dp_group_per_tp_group) * tensor_model_parallel_size + \
+                i % atten_dp_group_per_tp_group
+        ranks = range(start, start+tensor_model_parallel_size, atten_tensor_model_parallel_size)
+        group = torch.distributed.new_group(ranks, backend=backend)
+        if rank in ranks:
+            _ATTEN_DATA_MODEL_PARALLEL_GROUP = group
 
 
 def ensure_model_parallel_initialized(
-    tensor_model_parallel_size: int,
+    atten_tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    atten_data_model_parallel_size: int,
+    tensor_model_parallel_size: int,
     backend: Optional[str] = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
@@ -159,26 +241,41 @@ def ensure_model_parallel_initialized(
     # get the backend of _DEVICE_WORLD_GROUP
     backend = backend or torch.distributed.get_backend()
     if not model_parallel_is_initialized():
-        initialize_model_parallel(tensor_model_parallel_size,
-                                  pipeline_model_parallel_size, backend)
+        initialize_model_parallel(atten_tensor_model_parallel_size,
+                                  pipeline_model_parallel_size, 
+                                  atten_data_model_parallel_size,
+                                  tensor_model_parallel_size,
+                                  backend)
         return
 
     assert (
-        get_tensor_model_parallel_world_size() == tensor_model_parallel_size
-    ), ("tensor parallel group already initialized, but of unexpected size: "
-        f"{get_tensor_model_parallel_world_size()=} vs. "
-        f"{tensor_model_parallel_size=}")
+        get_atten_tensor_model_parallel_world_size() == atten_tensor_model_parallel_size
+    ), ("attention tensor parallel group already initialized, but of unexpected size: "
+        f"{get_atten_tensor_model_parallel_world_size()=} vs. "
+        f"{atten_tensor_model_parallel_size=}")
     assert (get_pipeline_model_parallel_world_size(
     ) == pipeline_model_parallel_size), (
         "pipeline parallel group already initialized, but of unexpected size: "
         f"{get_pipeline_model_parallel_world_size()=} vs. "
         f"{pipeline_model_parallel_size=}")
+    assert (
+        get_atten_data_model_parallel_world_size() == atten_data_model_parallel_size
+    ), ("attention data parallel group already initialized, but of unexpected size: "
+        f"{get_atten_data_model_parallel_world_size()=} vs. "
+        f"{atten_data_model_parallel_size=}")
+    assert (
+        get_tensor_model_parallel_world_size() == tensor_model_parallel_size
+    ), ("ffn tensor parallel group already initialized, but of unexpected size: "
+        f"{get_tensor_model_parallel_world_size()=} vs. "
+        f"{tensor_model_parallel_size=}")
 
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
-    return (_TENSOR_MODEL_PARALLEL_GROUP is not None
-            and _PIPELINE_MODEL_PARALLEL_GROUP is not None)
+    return (_ATTEN_TENSOR_MODEL_PARALLEL_GROUP is not None
+            and _PIPELINE_MODEL_PARALLEL_GROUP is not None
+            and _ATTEN_DATA_MODEL_PARALLEL_GROUP is not None
+            and _TENSOR_MODEL_PARALLEL_GROUP is not None)
 
 
 def get_cpu_world_group():
@@ -201,6 +298,20 @@ def get_pipeline_model_parallel_group():
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
+def get_atten_tensor_model_parallel_group():
+    """Get the attention tensor model parallel group the caller rank belongs to."""
+    assert _ATTEN_TENSOR_MODEL_PARALLEL_GROUP is not None, (
+        "attention tensor model parallel group is not initialized")
+    return _ATTEN_TENSOR_MODEL_PARALLEL_GROUP
+
+
+def get_atten_data_model_parallel_group():
+    """Get the attention data model parallel group the caller rank belongs to."""
+    assert _ATTEN_DATA_MODEL_PARALLEL_GROUP is not None, (
+        "pipeline model parallel group is not initialized")
+    return _ATTEN_DATA_MODEL_PARALLEL_GROUP
+
+
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     return torch.distributed.get_world_size(
@@ -213,6 +324,18 @@ def get_pipeline_model_parallel_world_size():
         group=get_pipeline_model_parallel_group())
 
 
+def get_atten_tensor_model_parallel_world_size():
+    """Return world size for the attention tensor model parallel group."""
+    return torch.distributed.get_world_size(
+        group=get_atten_tensor_model_parallel_group())
+
+
+def get_atten_data_model_parallel_world_size():
+    """Return world size for the attention data model parallel group."""
+    return torch.distributed.get_world_size(
+        group=get_atten_data_model_parallel_group())
+
+
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
@@ -222,6 +345,17 @@ def get_pipeline_model_parallel_rank():
     """Return my rank for the pipeline model parallel group."""
     return torch.distributed.get_rank(
         group=get_pipeline_model_parallel_group())
+
+
+def get_atten_data_model_parallel_rank():
+    """Return my rank for the attention data model parallel group."""
+    return torch.distributed.get_rank(
+        group=get_atten_data_model_parallel_group())
+
+
+def get_atten_tensor_model_parallel_rank():
+    """Return my rank for the attention tensor model parallel group."""
+    return torch.distributed.get_rank(group=get_atten_tensor_model_parallel_group())
 
 
 def get_tensor_model_parallel_src_rank():
@@ -267,21 +401,45 @@ def get_pipeline_model_parallel_prev_rank():
     return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
 
 
+def get_atten_tensor_model_parallel_group_ranks_list() -> List[List[int]]:
+    """
+    Return the global ranks of all attention tensor model
+    parallel group, when pp size is 1, The returned results 
+    can be seen as arranged in the order of dp
+    """
+    assert _ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS is not None, (
+        "Attention tensor parallel group is not initialized")
+    return _ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS
+
+
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TENSOR_MODEL_PARALLEL_GROUP
-    if _TENSOR_MODEL_PARALLEL_GROUP:
-        torch.distributed.destroy_process_group(_TENSOR_MODEL_PARALLEL_GROUP)
-    _TENSOR_MODEL_PARALLEL_GROUP = None
+    global _ATTEN_TENSOR_MODEL_PARALLEL_GROUP
+    if _ATTEN_TENSOR_MODEL_PARALLEL_GROUP:
+        torch.distributed.destroy_process_group(_ATTEN_TENSOR_MODEL_PARALLEL_GROUP)
+    _ATTEN_TENSOR_MODEL_PARALLEL_GROUP = None
+    global _ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS
+    _ALL_ATTEN_TENSOR_MODEL_PARALLEL_GROUP_RANKS = None
+
     global _PIPELINE_MODEL_PARALLEL_GROUP
     if _PIPELINE_MODEL_PARALLEL_GROUP:
         torch.distributed.destroy_process_group(_PIPELINE_MODEL_PARALLEL_GROUP)
     _PIPELINE_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_GLOBAL_RANKS
     _PIPELINE_GLOBAL_RANKS = None
-    from vllm.distributed.device_communicators import pynccl_utils
+
+    global _ATTEN_DATA_MODEL_PARALLEL_GROUP
+    if _ATTEN_DATA_MODEL_PARALLEL_GROUP:
+        torch.distributed.destroy_process_group(_ATTEN_DATA_MODEL_PARALLEL_GROUP)
+    _ATTEN_DATA_MODEL_PARALLEL_GROUP = None
+
+    global _TENSOR_MODEL_PARALLEL_GROUP
+    if _TENSOR_MODEL_PARALLEL_GROUP:
+        torch.distributed.destroy_process_group(_TENSOR_MODEL_PARALLEL_GROUP)
+    _TENSOR_MODEL_PARALLEL_GROUP = None
 
     # Destroy the pynccl states if any.
+    from vllm.distributed.device_communicators import pynccl_utils
     pynccl_utils.destroy_process_group()
 
 

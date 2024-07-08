@@ -135,6 +135,7 @@ class cmake_build_ext(build_ext):
         # Pass the python executable to cmake so it can find an exact
         # match.
         cmake_args += ['-DVLLM_PYTHON_EXECUTABLE={}'.format(sys.executable)]
+        cmake_args += ['-DCMAKE_EXPORT_COMPILE_COMMANDS=1']
 
         if _install_punica():
             cmake_args += ['-DVLLM_INSTALL_PUNICA_KERNELS=ON']

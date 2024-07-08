@@ -18,13 +18,17 @@ except ImportError:
 logger = init_logger(__name__)
 
 _CA_HANDLE = None
+# for atten sub group allreduce
+_SUB_CA_HANDLE = None
 _IS_CAPTURING = False
 _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
 
 
 def init_custom_ar() -> None:
     from vllm.distributed import (get_tensor_model_parallel_rank,
-                                  get_tensor_model_parallel_world_size)
+                                  get_atten_tensor_model_parallel_rank,
+                                  get_tensor_model_parallel_world_size,
+                                  get_atten_tensor_model_parallel_world_size)
 
     global _CA_HANDLE
     if _CA_HANDLE is not None:
@@ -63,7 +67,8 @@ def init_custom_ar() -> None:
     # test P2P capability
     # this is expensive to compute at the first time
     # then we cache the result
-    if not _can_p2p(rank, world_size):
+    can_p2p = _can_p2p(rank, world_size)
+    if not can_p2p:
         logger.warn(
             "Custom allreduce is disabled because your platform lacks GPU P2P"
             " capability or P2P test failed. To silence this warning, specify"
@@ -71,6 +76,52 @@ def init_custom_ar() -> None:
         return
     _CA_HANDLE = CustomAllreduce(rank, world_size, full_nvlink)
 
+
+    global _SUB_CA_HANDLE
+    if _SUB_CA_HANDLE is not None:
+        return
+
+    rank = get_atten_tensor_model_parallel_rank()
+    world_size = get_atten_tensor_model_parallel_world_size()
+    if world_size == 1:
+        # No need to initialize custom allreduce for single GPU case.
+        return
+    
+    if world_size not in _SUPPORTED_WORLD_SIZES:
+        logger.warn(
+            "Custom allreduce is disabled due to an unsupported world size: "
+            "%d. Supported world sizes: %s. To silence this warning, specify"
+            " disable_custom_all_reduce=True explicitly.", world_size,
+            str(_SUPPORTED_WORLD_SIZES))
+        return
+
+    if world_size > 2 and not full_nvlink:
+        logger.warn(
+            "Custom allreduce is disabled because it's not supported on more"
+            " than two PCIe-only GPUs. To silence this warning, specify"
+            " disable_custom_all_reduce=True explicitly.")
+        return
+    
+    # note: num dev can be larger than world_size if we're only using
+    # first few GPUs
+    if num_dev < world_size:
+        logger.warn(
+            "Cannot test GPU P2P because not all GPUs are visible to the "
+            "current process. This might be the case if 'CUDA_VISIBLE_DEVICES'"
+            " is set.")
+        return False
+
+    # test P2P capability
+    # this is expensive to compute at the first time
+    # then we cache the result
+    if not can_p2p:
+        logger.warn(
+            "Custom allreduce is disabled because your platform lacks GPU P2P"
+            " capability or P2P test failed. To silence this warning, specify"
+            " disable_custom_all_reduce=True explicitly.")
+        return
+    
+    _SUB_CA_HANDLE = CustomAllreduce(rank, world_size, full_nvlink, is_atten_ar=True)
 
 def begin_capture() -> None:
     global _IS_CAPTURING
@@ -83,15 +134,19 @@ def end_capture() -> None:
 
 
 def is_capturing() -> bool:
-    return _IS_CAPTURING and _CA_HANDLE is not None
+    return _IS_CAPTURING and _CA_HANDLE is not None and _SUB_CA_HANDLE is not None
 
 
 def get_handle() -> Optional["CustomAllreduce"]:
     return _CA_HANDLE
 
 
+def get_sub_handle() -> Optional["CustomAllreduce"]:
+    return _SUB_CA_HANDLE
+
+
 def is_initialized() -> bool:
-    return _CA_HANDLE is not None
+    return _CA_HANDLE is not None and _SUB_CA_HANDLE is not None
 
 
 @contextmanager
@@ -104,10 +159,36 @@ def capture():
         handle = get_handle()
         if handle is not None:
             handle.register_graph_buffers()
+        sub_handle = get_sub_handle()
+        if sub_handle is not None:
+            sub_handle.register_graph_buffers()
 
 
 def custom_all_reduce(input: torch.Tensor) -> Optional[torch.Tensor]:
     ca_handle = get_handle()
+    # when custom allreduce is disabled, this will be None
+    if ca_handle is None:
+        return
+    if is_capturing():
+        if torch.cuda.is_current_stream_capturing():
+            if ca_handle.should_custom_ar(input):
+                return ca_handle.all_reduce_reg(input)
+        else:
+            if ca_handle.should_custom_ar(input):
+                # if warm up, mimic the allocation pattern
+                # since custom allreduce is out-of-place
+                return torch.empty_like(input)
+    else:
+        # note: outside of cuda graph context,
+        # custom allreduce incurs a cost of cudaMemcpy, which should
+        # be small(<=1% of overall latency) compared to the performance
+        # gains of using custom kernels
+        if ca_handle.should_custom_ar(input):
+            return ca_handle.all_reduce_unreg(input)
+
+
+def custom_sub_all_reduce(input: torch.Tensor) -> Optional[torch.Tensor]:
+    ca_handle = get_sub_handle()
     # when custom allreduce is disabled, this will be None
     if ca_handle is None:
         return
@@ -173,11 +254,15 @@ class CustomAllreduce:
                  rank,
                  world_size,
                  full_nvlink,
-                 max_size=8192 * 1024) -> None:
+                 max_size=8192 * 1024,
+                 is_atten_ar=False) -> None:
+        self.is_atten_ar = is_atten_ar
         # buffers memory are owned by this Python class and passed to C++
         # meta data composes of two parts: meta data for synchronization
         # (256 bytes) and a temporary buffer for storing intermediate
         # allreduce results.
+
+        # 4KB + 8MB
         self.meta = torch.zeros(custom_ar.meta_size() + max_size,
                                 dtype=torch.uint8,
                                 device="cuda")
@@ -211,7 +296,11 @@ class CustomAllreduce:
 
     def _gather_ipc_meta(self, shard_data):
         all_data = [None] * self.world_size
-        dist.all_gather_object(all_data, shard_data)
+        if self.is_atten_ar:
+            from vllm.distributed import get_atten_tensor_model_parallel_group
+            dist.all_gather_object(all_data, shard_data, get_atten_tensor_model_parallel_group())
+        else:
+            dist.all_gather_object(all_data, shard_data)
 
         handles = []
         offsets = []
